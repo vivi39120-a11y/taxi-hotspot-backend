@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+pyarrow
+xgboost
+boto3
+pyproj
