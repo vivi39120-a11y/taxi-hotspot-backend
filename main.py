@@ -51,10 +51,10 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 REWARDS_DIR = Path("./rewards")
 REWARDS_DIR.mkdir(parents=True, exist_ok=True)
 
-R2_ENDPOINT = "https://10fdbc4ee28881b5403e531b6f547454.r2.cloudflarestorage.com"
-R2_BUCKET = "taxi-artifacts"
-AWS_ACCESS_KEY_ID = "cf2c89481fb139e09fe89c367ef518b3"
-AWS_SECRET_ACCESS_KEY = "516718477cb23ba49cea380198590ea822e260cfdc0b80a08e63f9bb60d1ec52"
+R2_ENDPOINT = os.getenv("R2_ENDPOINT")
+R2_BUCKET = os.getenv("R2_BUCKET")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 KEY_PARQUET = "data/test_hourly.parquet"
 KEY_MODEL_XGB = "model/xgb_demand_poisson.model"
@@ -82,7 +82,7 @@ MODEL_ENABLED = os.getenv("MODEL_ENABLED", "1").strip() not in ("0", "false", "F
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 正式上線可改成特定前端網域
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -98,6 +98,7 @@ STATE: Dict[str, Any] = {
     "model_ready": False,
     "reward_df": None,
     "hotspots_df": None,
+    "model_init_error": None,
 }
 
 # =========================
@@ -106,7 +107,12 @@ STATE: Dict[str, Any] = {
 def _now_iso() -> str:
     return pd.Timestamp.utcnow().isoformat()
 
+def _r2_config_ok() -> bool:
+    return all([R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY])
+
 def s3_client():
+    if not _r2_config_ok():
+        raise RuntimeError("Missing R2 environment variables")
     return boto3.client(
         "s3",
         endpoint_url=R2_ENDPOINT,
@@ -129,8 +135,8 @@ def download_sync(key: str, dst: Path, label: str):
     try:
         s3_client().download_file(R2_BUCKET, key, str(dst))
         print(f"⬇️ [Download] {label} ✅")
-    except Exception:
-        print(f"⚠️ {label} 下載跳過")
+    except Exception as e:
+        print(f"⚠️ {label} 下載跳過: {e}")
 
 def centroids_to_wgs84(df_cent: pd.DataFrame) -> pd.DataFrame:
     t = Transformer.from_crs("EPSG:2263", "EPSG:4326", always_xy=True)
@@ -192,15 +198,25 @@ def build_hotspots_df(
 # Model init
 # =========================
 def init_model():
-    if not MODEL_ENABLED:
+    if STATE["model_ready"]:
         return
 
+    if not MODEL_ENABLED:
+        STATE["model_init_error"] = "MODEL_ENABLED is false"
+        return
+
+    if not _r2_config_ok():
+        STATE["model_init_error"] = "Missing R2 environment variables"
+        raise RuntimeError(STATE["model_init_error"])
+
     print("🔄 Initializing Models & Data...")
+    STATE["model_init_error"] = None
 
     download_sync(KEY_MODEL_XGB, MODEL_PATH_XGB, "XGB")
     download_sync(KEY_PARQUET, PARQUET_PATH, "Parquet")
     download_sync(KEY_CENT, CENT_PATH, "Centroids")
     download_sync(KEY_311, PATH_311, "311_CSV")
+
     if NET_PATH.exists():
         print(f"NetXML exists, skip: {NET_PATH}")
     else:
@@ -257,16 +273,22 @@ def init_model():
             generate_ranking_reports(df_pred, CENT_PATH, OUT_DIR)
 
             try:
-                STATE["hotspots_df"] = build_hotspots_df(STATE["pred_df"], STATE["cent"], STATE["reward_df"])
+                STATE["hotspots_df"] = build_hotspots_df(
+                    STATE["pred_df"],
+                    STATE["cent"],
+                    STATE["reward_df"],
+                )
             except Exception as e:
                 print(f"⚠️ build_hotspots_df failed: {e}")
                 STATE["hotspots_df"] = None
 
         STATE["model_ready"] = True
-        print("✅ Startup Complete.")
+        print("✅ Model init complete.")
     except Exception as e:
-        print(f"❌ Init failed: {e}")
         STATE["model_ready"] = False
+        STATE["model_init_error"] = str(e)
+        print(f"❌ Init failed: {e}")
+        raise
 
 # =========================
 # JSON Store (派遣系統資料)
@@ -343,8 +365,6 @@ class CreateOrderBody(BaseModel):
     dropoff: str
     pickupLocation: LatLng
     dropoffLocation: LatLng
-
-    # ✅ 相容前端 payload（不影響原功能）
     stops: Optional[List[Dict[str, Any]]] = None
     vehicleType: Optional[str] = None
     estimatedPrice: Optional[float] = None
@@ -358,8 +378,11 @@ class AcceptOrderBody(BaseModel):
 # =========================
 @app.on_event("startup")
 def startup_all():
-    init_model()
-    load_store()
+    try:
+        load_store()
+        print("✅ Store loaded.")
+    except Exception as e:
+        print(f"⚠️ load_store failed: {e}")
 
 # =========================
 # Health
@@ -369,6 +392,7 @@ def api_health():
     return {
         "ok": True,
         "model_ready": STATE["model_ready"],
+        "model_init_error": STATE["model_init_error"],
         "drivers": len(STORE["drivers"]),
         "orders": len(STORE["orders"]),
     }
@@ -378,8 +402,17 @@ def api_health():
 # =========================
 @app.get("/api/hotspots")
 def hotspots(n: int = 20, sort_by: str = "final_score"):
-    if not STATE["model_ready"] or STATE["pred_df"] is None:
-        raise HTTPException(503, "Not ready")
+    if not STATE["model_ready"]:
+        try:
+            init_model()
+        except Exception as e:
+            raise HTTPException(503, f"Model init failed: {e}")
+
+    if not STATE["model_ready"]:
+        raise HTTPException(503, "Model not ready")
+
+    if STATE["pred_df"] is None:
+        raise HTTPException(503, "Prediction not ready")
 
     df = STATE.get("hotspots_df")
     if df is None or df.empty:
@@ -389,8 +422,16 @@ def hotspots(n: int = 20, sort_by: str = "final_score"):
     if sort_by not in df.columns:
         sort_by = PRED_COL if PRED_COL in df.columns else df.columns[0]
 
-    df_out = df.sort_values(sort_by, ascending=False).head(int(n))
-    return {"predict_hour": str(STATE["pred_hour"]), "rows": df_out.to_dict(orient="records")}
+    try:
+        n = int(n)
+    except Exception:
+        n = 20
+
+    df_out = df.sort_values(sort_by, ascending=False).head(n)
+    return {
+        "predict_hour": str(STATE["pred_hour"]),
+        "rows": df_out.to_dict(orient="records"),
+    }
 
 @app.get("/api/driver-bias/{driver_id}")
 def get_driver_reward_bias(driver_id: int):
@@ -441,13 +482,8 @@ def api_register(body: RegisterBody):
 
 @app.post("/api/login")
 def api_login(body: LoginBody):
-    """
-    ✅ 給前端 passenger login 用：
-      - 成功回 { ok: True, user: {...} }
-    """
     u = _find_user(body.username)
     if not u:
-        # 讓前端好判斷（你前端有用 errorCode）
         raise HTTPException(404, detail={"errorCode": "NO_SUCH_ACCOUNT", "error": "Not found"})
 
     if str(u.get("password", "")) != str(body.password):
@@ -457,10 +493,6 @@ def api_login(body: LoginBody):
 
 @app.post("/api/driver-login")
 def api_driver_login(body: DriverLoginBody):
-    """
-    ✅ 給前端 driver-login 用（demo：允許「不存在就建立」）
-      - 回傳 driver 物件（至少含 id/name/lat/lng）
-    """
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(400, "Missing name")
@@ -481,7 +513,6 @@ def api_driver_login(body: DriverLoginBody):
         save_store()
         return d
 
-    # 更新 carType（若有帶）
     if body.carType is not None:
         d["carType"] = body.carType
     d["updatedAt"] = _now_iso()
@@ -504,13 +535,10 @@ def api_create_order(body: CreateOrderBody):
         "dropoff": body.dropoff,
         "pickupLocation": body.pickupLocation.model_dump(),
         "dropoffLocation": body.dropoffLocation.model_dump(),
-
-        # ✅ 相容前端
         "stops": body.stops or [],
         "vehicleType": body.vehicleType,
         "estimatedPrice": body.estimatedPrice,
         "distanceKm": body.distanceKm,
-
         "createdAt": _now_iso(),
     }
     STORE["orders"].append(order)
@@ -530,9 +558,6 @@ def api_accept_order(order_id: int, body: AcceptOrderBody):
 
 @app.post("/api/orders/{order_id}/complete")
 def api_complete_order(order_id: int):
-    """
-    ✅ 給前端 markOrderCompleted 用：把訂單改 completed
-    """
     o = _find_order(order_id)
     if not o:
         raise HTTPException(404, "Not found")
@@ -571,42 +596,59 @@ def api_get_drivers():
 # =========================
 @app.post("/api/admin/run-pipeline")
 def api_run_pipeline(background_tasks: BackgroundTasks):
+    if not STATE["model_ready"]:
+        try:
+            init_model()
+        except Exception as e:
+            raise HTTPException(503, f"Model init failed: {e}")
+
+    if STATE["booster"] is None or STATE["hourly"] is None:
+        raise HTTPException(503, "Model artifacts not ready")
+
     def task():
-        df_pred = run_prediction_task(
-            STATE["booster"],
-            STATE["hourly"],
-            CENT_PATH,
-            OUT_DIR / "pred_next_hour_advanced.csv",
-        )
-
-        pred_csv_path = OUT_DIR / "pred_next_hour_advanced.csv"
-        if pred_csv_path.exists():
-            df_pred = pd.read_csv(pred_csv_path)
-
-        STATE["pred_df"] = df_pred
-        upload_to_r2(OUT_DIR / "pred_next_hour_advanced.csv", KEY_OUT_PRED)
-
         try:
-            reward_path = OUT_DIR / "zone_reward.csv"
-            if run_311_analysis is not None:
-                run_311_analysis(PATH_311, CENT_PATH, reward_path)
+            df_pred = run_prediction_task(
+                STATE["booster"],
+                STATE["hourly"],
+                CENT_PATH,
+                OUT_DIR / "pred_next_hour_advanced.csv",
+            )
 
-            if reward_path.exists():
-                STATE["reward_df"] = pd.read_csv(reward_path)
-                upload_to_r2(reward_path, KEY_OUT_REWARD)
-            else:
+            pred_csv_path = OUT_DIR / "pred_next_hour_advanced.csv"
+            if pred_csv_path.exists():
+                df_pred = pd.read_csv(pred_csv_path)
+
+            STATE["pred_df"] = df_pred
+            upload_to_r2(OUT_DIR / "pred_next_hour_advanced.csv", KEY_OUT_PRED)
+
+            try:
+                reward_path = OUT_DIR / "zone_reward.csv"
+                if run_311_analysis is not None:
+                    run_311_analysis(PATH_311, CENT_PATH, reward_path)
+
+                if reward_path.exists():
+                    STATE["reward_df"] = pd.read_csv(reward_path)
+                    upload_to_r2(reward_path, KEY_OUT_REWARD)
+                else:
+                    STATE["reward_df"] = None
+            except Exception as e:
+                print(f"⚠️ Reward update failed: {e}")
                 STATE["reward_df"] = None
-        except Exception as e:
-            print(f"⚠️ Reward update failed: {e}")
-            STATE["reward_df"] = None
 
-        generate_ranking_reports(df_pred, CENT_PATH, OUT_DIR)
+            generate_ranking_reports(df_pred, CENT_PATH, OUT_DIR)
 
-        try:
-            STATE["hotspots_df"] = build_hotspots_df(STATE["pred_df"], STATE["cent"], STATE["reward_df"])
+            try:
+                STATE["hotspots_df"] = build_hotspots_df(
+                    STATE["pred_df"],
+                    STATE["cent"],
+                    STATE["reward_df"],
+                )
+            except Exception as e:
+                print(f"⚠️ build_hotspots_df failed: {e}")
+                STATE["hotspots_df"] = None
+
         except Exception as e:
-            print(f"⚠️ build_hotspots_df failed: {e}")
-            STATE["hotspots_df"] = None
+            print(f"❌ Pipeline task failed: {e}")
 
     background_tasks.add_task(task)
     return {"ok": True, "message": "Pipeline started"}
