@@ -6,3 +6,4 @@ xgboost
 boto3
 pyproj
 httpx
+folium
