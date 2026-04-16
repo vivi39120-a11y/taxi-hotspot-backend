@@ -5,3 +5,4 @@ pyarrow
 xgboost
 boto3
 pyproj
+httpx
