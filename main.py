@@ -1,40 +1,14 @@
 # main.py
-# (整合進階預測、獎勵機制與派遣系統修正版：hotspots + register/login + drivers/orders)
 import os
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional, List
+from datetime import datetime, timezone
 
 import httpx
-import boto3
-import pandas as pd
-import xgboost as xgb
-from pyproj import Transformer
-
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-# ✅ 引入邏輯模組
-from logic import (
-    run_prediction_task,
-    generate_visualization_xml,  # 保留
-    generate_traffic_trips,      # 保留
-    generate_ranking_reports,
-)
-
-# ✅ 引入獎勵機制與 MOD 邏輯（保底）
-try:
-    from logic.build_zone_reward_from_311 import run_311_reward_analysis as run_311_analysis
-except Exception:
-    run_311_analysis = None
-    print("⚠️ build_zone_reward_from_311 匯入失敗，已跳過 311 分析功能")
-
-try:
-    from MOD.reward_mod import get_bias
-except Exception:
-    get_bias = None
-    print("⚠️ MOD.reward_mod 匯入失敗，driver-bias 將回傳 1.0")
 
 # =========================
 # Config
@@ -82,7 +56,7 @@ MODEL_ENABLED = os.getenv("MODEL_ENABLED", "1").strip() not in ("0", "false", "F
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 正式上線可改成特定前端網域
+    allow_origins=["*"],  # 正式上線再縮成前端網域
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -102,17 +76,64 @@ STATE: Dict[str, Any] = {
 }
 
 # =========================
-# Helpers & R2
+# JSON Store (派遣系統資料)
+# =========================
+USERS_PATH = DATA_DIR / "users.json"
+DRIVERS_PATH = DATA_DIR / "drivers.json"
+ORDERS_PATH = DATA_DIR / "orders.json"
+META_PATH = DATA_DIR / "meta.json"
+
+STORE: Dict[str, Any] = {
+    "users": [],
+    "drivers": [],
+    "orders": [],
+    "meta": {"next_user_id": 1, "next_order_id": 1, "next_driver_id": 1},
+}
+
+# =========================
+# Helpers
 # =========================
 def _now_iso() -> str:
-    return pd.Timestamp.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 def _r2_config_ok() -> bool:
     return all([R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY])
 
+def save_store():
+    for k, p in zip(
+        ["users", "drivers", "orders", "meta"],
+        [USERS_PATH, DRIVERS_PATH, ORDERS_PATH, META_PATH],
+    ):
+        p.write_text(json.dumps(STORE[k], ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_store():
+    for k, p in zip(
+        ["users", "drivers", "orders", "meta"],
+        [USERS_PATH, DRIVERS_PATH, ORDERS_PATH, META_PATH],
+    ):
+        if p.exists():
+            STORE[k] = json.loads(p.read_text(encoding="utf-8"))
+
+def _find_driver(driver_id: int):
+    return next((d for d in STORE["drivers"] if int(d.get("id", 0)) == int(driver_id)), None)
+
+def _find_driver_by_name(name: str):
+    name = (name or "").strip()
+    return next((d for d in STORE["drivers"] if str(d.get("name", "")).strip() == name), None)
+
+def _find_user(username: str):
+    username = (username or "").strip()
+    return next((u for u in STORE["users"] if str(u.get("username", "")).strip() == username), None)
+
+def _find_order(order_id: int):
+    return next((o for o in STORE["orders"] if int(o.get("id", 0)) == int(order_id)), None)
+
 def s3_client():
     if not _r2_config_ok():
         raise RuntimeError("Missing R2 environment variables")
+
+    import boto3
+
     return boto3.client(
         "s3",
         endpoint_url=R2_ENDPOINT,
@@ -138,7 +159,9 @@ def download_sync(key: str, dst: Path, label: str):
     except Exception as e:
         print(f"⚠️ {label} 下載跳過: {e}")
 
-def centroids_to_wgs84(df_cent: pd.DataFrame) -> pd.DataFrame:
+def centroids_to_wgs84(df_cent):
+    from pyproj import Transformer
+
     t = Transformer.from_crs("EPSG:2263", "EPSG:4326", always_xy=True)
     lon_deg, lat_deg = t.transform(
         df_cent["lon"].astype(float).values,
@@ -148,11 +171,9 @@ def centroids_to_wgs84(df_cent: pd.DataFrame) -> pd.DataFrame:
     out["lon"], out["lat"] = lon_deg, lat_deg
     return out[["LocationID", "Borough", "Zone", "lat", "lon"]]
 
-def build_hotspots_df(
-    pred_df: pd.DataFrame,
-    cent_df: pd.DataFrame,
-    reward_df: Optional[pd.DataFrame],
-) -> pd.DataFrame:
+def build_hotspots_df(pred_df, cent_df, reward_df):
+    import pandas as pd
+
     if pred_df is None or pred_df.empty:
         return pd.DataFrame()
 
@@ -195,7 +216,7 @@ def build_hotspots_df(
     return df
 
 # =========================
-# Model init
+# Lazy model init
 # =========================
 def init_model():
     if STATE["model_ready"]:
@@ -208,6 +229,17 @@ def init_model():
     if not _r2_config_ok():
         STATE["model_init_error"] = "Missing R2 environment variables"
         raise RuntimeError(STATE["model_init_error"])
+
+    # 重套件與重邏輯全部延後到這裡
+    import pandas as pd
+    import xgboost as xgb
+    from logic import run_prediction_task, generate_ranking_reports
+
+    try:
+        from logic.build_zone_reward_from_311 import run_311_reward_analysis as run_311_analysis
+    except Exception:
+        run_311_analysis = None
+        print("⚠️ build_zone_reward_from_311 匯入失敗，已跳過 311 分析功能")
 
     print("🔄 Initializing Models & Data...")
     STATE["model_init_error"] = None
@@ -291,50 +323,6 @@ def init_model():
         raise
 
 # =========================
-# JSON Store (派遣系統資料)
-# =========================
-USERS_PATH = DATA_DIR / "users.json"
-DRIVERS_PATH = DATA_DIR / "drivers.json"
-ORDERS_PATH = DATA_DIR / "orders.json"
-META_PATH = DATA_DIR / "meta.json"
-
-STORE: Dict[str, Any] = {
-    "users": [],
-    "drivers": [],
-    "orders": [],
-    "meta": {"next_user_id": 1, "next_order_id": 1, "next_driver_id": 1},
-}
-
-def save_store():
-    for k, p in zip(
-        ["users", "drivers", "orders", "meta"],
-        [USERS_PATH, DRIVERS_PATH, ORDERS_PATH, META_PATH],
-    ):
-        p.write_text(json.dumps(STORE[k], ensure_ascii=False, indent=2), encoding="utf-8")
-
-def load_store():
-    for k, p in zip(
-        ["users", "drivers", "orders", "meta"],
-        [USERS_PATH, DRIVERS_PATH, ORDERS_PATH, META_PATH],
-    ):
-        if p.exists():
-            STORE[k] = json.loads(p.read_text(encoding="utf-8"))
-
-def _find_driver(driver_id: int):
-    return next((d for d in STORE["drivers"] if int(d.get("id", 0)) == int(driver_id)), None)
-
-def _find_driver_by_name(name: str):
-    name = (name or "").strip()
-    return next((d for d in STORE["drivers"] if str(d.get("name", "")).strip() == name), None)
-
-def _find_user(username: str):
-    username = (username or "").strip()
-    return next((u for u in STORE["users"] if str(u.get("username", "")).strip() == username), None)
-
-def _find_order(order_id: int):
-    return next((o for o in STORE["orders"] if int(o.get("id", 0)) == int(order_id)), None)
-
-# =========================
 # Pydantic models
 # =========================
 class RegisterBody(BaseModel):
@@ -415,7 +403,7 @@ def hotspots(n: int = 20, sort_by: str = "final_score"):
         raise HTTPException(503, "Prediction not ready")
 
     df = STATE.get("hotspots_df")
-    if df is None or df.empty:
+    if df is None or len(df) == 0:
         df = STATE["pred_df"].copy()
 
     sort_by = (sort_by or "").strip()
@@ -437,6 +425,11 @@ def hotspots(n: int = 20, sort_by: str = "final_score"):
 def get_driver_reward_bias(driver_id: int):
     bias = 1.0
     try:
+        try:
+            from MOD.reward_mod import get_bias
+        except Exception:
+            get_bias = None
+
         if get_bias is not None:
             bias = float(get_bias(OUT_DIR, enable=True))
     except Exception:
@@ -606,7 +599,15 @@ def api_run_pipeline(background_tasks: BackgroundTasks):
         raise HTTPException(503, "Model artifacts not ready")
 
     def task():
+        import pandas as pd
+        from logic import run_prediction_task, generate_ranking_reports
+
         try:
+            try:
+                from logic.build_zone_reward_from_311 import run_311_reward_analysis as run_311_analysis
+            except Exception:
+                run_311_analysis = None
+
             df_pred = run_prediction_task(
                 STATE["booster"],
                 STATE["hourly"],
