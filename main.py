@@ -9,7 +9,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import os
 
+print("R2_ENDPOINT =", os.getenv("R2_ENDPOINT"))
+print("R2_BUCKET =", os.getenv("R2_BUCKET"))
+print("AWS_ACCESS_KEY_ID exists =", bool(os.getenv("AWS_ACCESS_KEY_ID")))
+print("AWS_SECRET_ACCESS_KEY exists =", bool(os.getenv("AWS_SECRET_ACCESS_KEY")))
 # =========================
 # Config
 # =========================
