@@ -107,11 +107,18 @@ AIRPORT_KEYWORDS = ["Airport", "JFK", "LaGuardia", "LGA"]
 # FastAPI app & State
 # =========================
 app = FastAPI()
+
+ALLOWED_ORIGINS = [
+    "https://taxi-dispatch-frontend-2.onrender.com",
+    "http://localhost:4173",
+    "http://localhost:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
