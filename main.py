@@ -13,7 +13,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
+
 
 
 
@@ -163,11 +163,12 @@ def ensure_model_ready():
     with INIT_LOCK:
         if STATE["model_ready"]:
             return
+        STATE["model_init_error"] = None
         try:
             init_model()
         except Exception as e:
             raise HTTPException(503, f"Model init failed: {e}")
-        
+             
 
 def save_store():
     for k, p in zip(
@@ -261,7 +262,7 @@ def download_sync(key: str, dst: Path, label: str):
     except Exception as e:
         print(f"❌ {label} 下載失敗: {e}")
         raise
-    
+
 def centroids_to_wgs84(df_cent):
     from pyproj import Transformer
 
@@ -563,27 +564,29 @@ def init_model():
         run_311_analysis = None
         print("⚠️ build_zone_reward_from_311 匯入失敗，已跳過 311 分析功能")
 
-print("🔄 Initializing Models & Data.")
-
-print("STEP 1: download XGB")
-download_sync(KEY_MODEL_XGB, MODEL_PATH_XGB, "XGB")
-
-print("STEP 2: download Parquet")
-download_sync(KEY_PARQUET, PARQUET_PATH, "Parquet")
-
-print("STEP 3: download Centroids")
-download_sync(KEY_CENT, CENT_PATH, "Centroids")
-
-print("STEP 4: download 311 CSV")
-download_sync(KEY_311, PATH_311, "311_CSV")
-
-if NET_PATH.exists():
-    print(f"NetXML exists, skip: {NET_PATH}")
-else:
-    print("STEP 5: download NetXML")
-    download_sync(KEY_NET, NET_PATH, "NetXML")
-
     try:
+        STATE["model_init_error"] = None
+
+        print("🔄 Initializing Models & Data...")
+
+        print("STEP 1: download XGB")
+        download_sync(KEY_MODEL_XGB, MODEL_PATH_XGB, "XGB")
+
+        print("STEP 2: download Parquet")
+        download_sync(KEY_PARQUET, PARQUET_PATH, "Parquet")
+
+        print("STEP 3: download Centroids")
+        download_sync(KEY_CENT, CENT_PATH, "Centroids")
+
+        print("STEP 4: download 311 CSV")
+        download_sync(KEY_311, PATH_311, "311_CSV")
+
+        if NET_PATH.exists():
+            print(f"NetXML exists, skip: {NET_PATH}")
+        else:
+            print("STEP 5: download NetXML")
+            download_sync(KEY_NET, NET_PATH, "NetXML")
+
         print("STEP 6: load xgboost model")
         if not MODEL_PATH_XGB.exists():
             raise FileNotFoundError(f"XGB model file not found: {MODEL_PATH_XGB}")
@@ -592,9 +595,15 @@ else:
         booster.load_model(str(MODEL_PATH_XGB))
         STATE["booster"] = booster
 
+        print("STEP 7: read centroids csv")
+        if not CENT_PATH.exists():
+            raise FileNotFoundError(f"Centroid file not found: {CENT_PATH}")
         cent = pd.read_csv(CENT_PATH)
         STATE["cent"] = centroids_to_wgs84(cent)
 
+        print("STEP 8: read parquet")
+        if not PARQUET_PATH.exists():
+            raise FileNotFoundError(f"Parquet file not found: {PARQUET_PATH}")
         df = pd.read_parquet(PARQUET_PATH)
         df[RAW_TIME_COL] = pd.to_datetime(df[RAW_TIME_COL])
         STATE["hourly"] = df
@@ -655,6 +664,7 @@ else:
 
         STATE["model_ready"] = True
         print("✅ Model init complete.")
+
     except Exception as e:
         STATE["model_ready"] = False
         STATE["model_init_error"] = str(e)
