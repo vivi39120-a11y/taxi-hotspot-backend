@@ -1,6 +1,7 @@
 import os
 import random
 import json
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
@@ -127,6 +128,7 @@ STATE: Dict[str, Any] = {
     "model_init_error": None,
     "dispatch_zones_loaded_at": None,
 }
+INIT_LOCK = threading.Lock()
 
 # =========================
 # JSON Store (派遣系統資料)
@@ -154,6 +156,18 @@ def _now_iso() -> str:
 def _r2_config_ok() -> bool:
     env = _get_r2_env()
     return all(env.values())
+def ensure_model_ready():
+    if STATE["model_ready"]:
+        return
+
+    with INIT_LOCK:
+        if STATE["model_ready"]:
+            return
+        try:
+            init_model()
+        except Exception as e:
+            raise HTTPException(503, f"Model init failed: {e}")
+        
 
 def save_store():
     for k, p in zip(
@@ -547,36 +561,7 @@ def init_model():
 
     print("🔄 Initializing Models & Data...")
 
-    print("STEP 1: download XGB")
-    download_sync(KEY_MODEL_XGB, MODEL_PATH_XGB, "XGB")
-
-    print("STEP 2: download Parquet")
-    download_sync(KEY_PARQUET, PARQUET_PATH, "Parquet")
-
-    print("STEP 3: download Centroids")
-    download_sync(KEY_CENT, CENT_PATH, "Centroids")
-
-    print("STEP 4: download 311 CSV")
-    download_sync(KEY_311, PATH_311, "311_CSV")
-
-    if NET_PATH.exists():
-        print(f"NetXML exists, skip: {NET_PATH}")
-    else:
-        print("STEP 5: download NetXML")
-        download_sync(KEY_NET, NET_PATH, "NetXML")
-
-    print("STEP 6: load xgboost model")
-    booster = xgb.Booster()
-    booster.load_model(str(MODEL_PATH_XGB))
-
-    print("STEP 7: read centroids csv")
-    cent = pd.read_csv(CENT_PATH)
-
-    print("STEP 8: read parquet")
-    df = pd.read_parquet(PARQUET_PATH)
-
-    print("STEP 9: run prediction task")
-
+  
 
     if NET_PATH.exists():
         print(f"NetXML exists, skip: {NET_PATH}")
@@ -714,7 +699,7 @@ def startup_all():
         print(f"⚠️ load_store failed: {e}")
 
     print("🚀 Server started. Model will be loaded lazily on first API call.")
-    
+
 # =========================
 # Health
 # =========================
@@ -736,11 +721,7 @@ def api_health():
 # =========================
 @app.get("/api/hotspots")
 def hotspots(n: int = 20, sort_by: str = "final_score"):
-    if not STATE["model_ready"]:
-        try:
-            init_model()
-        except Exception as e:
-            raise HTTPException(503, f"Model init failed: {e}")
+    ensure_model_ready()
 
     if not STATE["model_ready"]:
         raise HTTPException(503, "Model not ready")
@@ -770,11 +751,7 @@ def hotspots(n: int = 20, sort_by: str = "final_score"):
 
 @app.get("/api/zone-hotspots")
 def api_zone_hotspots():
-    if not STATE["model_ready"]:
-        try:
-            init_model()
-        except Exception as e:
-            raise HTTPException(503, f"Model init failed: {e}")
+    ensure_model_ready()
 
     try:
         df = get_dispatch_zones(force=False).copy()
@@ -791,11 +768,7 @@ def api_zone_hotspots():
 
 @app.get("/api/dispatch-recommendations")
 def api_dispatch_recommendations(driver_id: Optional[int] = None, lat: Optional[float] = None, lng: Optional[float] = None, top_k: int = TOP_K_RESULT):
-    if not STATE["model_ready"]:
-        try:
-            init_model()
-        except Exception as e:
-            raise HTTPException(503, f"Model init failed: {e}")
+    ensure_model_ready()
 
     try:
         df = get_dispatch_zones(force=False)
@@ -1060,11 +1033,7 @@ def api_get_drivers():
 # =========================
 @app.post("/api/admin/run-pipeline")
 def api_run_pipeline(background_tasks: BackgroundTasks):
-    if not STATE["model_ready"]:
-        try:
-            init_model()
-        except Exception as e:
-            raise HTTPException(503, f"Model init failed: {e}")
+    ensure_model_ready()
 
     if STATE["booster"] is None or STATE["hourly"] is None:
         raise HTTPException(503, "Model artifacts not ready")
@@ -1134,11 +1103,7 @@ def api_run_pipeline(background_tasks: BackgroundTasks):
 
 @app.post("/api/admin/reload-dispatch-zones")
 def api_reload_dispatch_zones():
-    if not STATE["model_ready"]:
-        try:
-            init_model()
-        except Exception as e:
-            raise HTTPException(503, f"Model init failed: {e}")
+    ensure_model_ready()
 
     try:
         df = get_dispatch_zones(force=True)
