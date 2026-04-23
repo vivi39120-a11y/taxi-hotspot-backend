@@ -2,6 +2,7 @@ import os
 import random
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
@@ -129,7 +130,25 @@ STATE: Dict[str, Any] = {
     "dispatch_zones_loaded_at": None,
 }
 INIT_LOCK = threading.Lock()
+PRELOAD_STARTED = False
 
+def preload_model_background():
+    global PRELOAD_STARTED
+    if PRELOAD_STARTED:
+        return
+    PRELOAD_STARTED = True
+
+    def _worker():
+        try:
+            # 稍微等 server 起來，避免卡住 Render port 偵測
+            time.sleep(2)
+            print("🚀 Background preload started...")
+            ensure_model_ready()
+            print("✅ Background preload finished.")
+        except Exception as e:
+            print(f"⚠️ Background preload failed: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 # =========================
 # JSON Store (派遣系統資料)
 # =========================
@@ -160,15 +179,13 @@ def ensure_model_ready():
     if STATE["model_ready"]:
         return
 
-    with INIT_LOCK:
-        if STATE["model_ready"]:
-            return
-        STATE["model_init_error"] = None
-        try:
-            init_model()
-        except Exception as e:
-            raise HTTPException(503, f"Model init failed: {e}")
-             
+    if STATE.get("model_init_error"):
+        print(f"ℹ️ Previous model_init_error: {STATE['model_init_error']}")
+
+    try:
+        init_model()
+    except Exception as e:
+        raise HTTPException(503, f"Model init failed: {e}")     
 
 def save_store():
     for k, p in zip(
@@ -727,8 +744,8 @@ def startup_all():
     except Exception as e:
         print(f"⚠️ load_store failed: {e}")
 
-    print("🚀 Server started. Model will be loaded lazily on first API call.")
-
+    print("🚀 Server started. Model preload will run in background.")
+    preload_model_background()
 # =========================
 # Health
 # =========================
