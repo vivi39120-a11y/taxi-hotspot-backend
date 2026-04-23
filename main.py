@@ -253,11 +253,15 @@ def download_sync(key: str, dst: Path, label: str):
         env = _get_r2_env()
         print(f"DOWNLOAD TRY: label={label}, bucket={env['R2_BUCKET']}, key={key}, dst={dst}")
         s3_client().download_file(env["R2_BUCKET"], key, str(dst))
-        print(f"⬇️ [Download] {label} ✅")
-    except Exception as e:
-        print(f"⚠️ {label} 下載跳過: {e}")
-        raise
 
+        if not dst.exists():
+            raise FileNotFoundError(f"{label} downloaded but file not found at {dst}")
+
+        print(f"⬇️ [Download] {label} ✅ -> {dst}")
+    except Exception as e:
+        print(f"❌ {label} 下載失敗: {e}")
+        raise
+    
 def centroids_to_wgs84(df_cent):
     from pyproj import Transformer
 
@@ -559,16 +563,31 @@ def init_model():
         run_311_analysis = None
         print("⚠️ build_zone_reward_from_311 匯入失敗，已跳過 311 分析功能")
 
-    print("🔄 Initializing Models & Data...")
+print("🔄 Initializing Models & Data.")
 
-  
+print("STEP 1: download XGB")
+download_sync(KEY_MODEL_XGB, MODEL_PATH_XGB, "XGB")
 
-    if NET_PATH.exists():
-        print(f"NetXML exists, skip: {NET_PATH}")
-    else:
-        download_sync(KEY_NET, NET_PATH, "NetXML")
+print("STEP 2: download Parquet")
+download_sync(KEY_PARQUET, PARQUET_PATH, "Parquet")
+
+print("STEP 3: download Centroids")
+download_sync(KEY_CENT, CENT_PATH, "Centroids")
+
+print("STEP 4: download 311 CSV")
+download_sync(KEY_311, PATH_311, "311_CSV")
+
+if NET_PATH.exists():
+    print(f"NetXML exists, skip: {NET_PATH}")
+else:
+    print("STEP 5: download NetXML")
+    download_sync(KEY_NET, NET_PATH, "NetXML")
 
     try:
+        print("STEP 6: load xgboost model")
+        if not MODEL_PATH_XGB.exists():
+            raise FileNotFoundError(f"XGB model file not found: {MODEL_PATH_XGB}")
+
         booster = xgb.Booster()
         booster.load_model(str(MODEL_PATH_XGB))
         STATE["booster"] = booster
