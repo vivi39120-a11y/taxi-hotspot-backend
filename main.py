@@ -713,12 +713,8 @@ def startup_all():
     except Exception as e:
         print(f"⚠️ load_store failed: {e}")
 
-    try:
-        init_model()
-        print("✅ Model initialized at startup.")
-    except Exception as e:
-        print(f"⚠️ init_model failed at startup: {e}")
-
+    print("🚀 Server started. Model will be loaded lazily on first API call.")
+    
 # =========================
 # Health
 # =========================
