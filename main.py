@@ -1,9 +1,12 @@
-# main.py
 import os
+import random
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -11,10 +14,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 
-print("R2_ENDPOINT =", os.getenv("R2_ENDPOINT"))
-print("R2_BUCKET =", os.getenv("R2_BUCKET"))
-print("AWS_ACCESS_KEY_ID exists =", bool(os.getenv("AWS_ACCESS_KEY_ID")))
-print("AWS_SECRET_ACCESS_KEY exists =", bool(os.getenv("AWS_SECRET_ACCESS_KEY")))
+
+
+def _get_r2_env():
+    return {
+        "R2_ENDPOINT": os.getenv("R2_ENDPOINT"),
+        "R2_BUCKET": os.getenv("R2_BUCKET"),
+        "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID"),
+        "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY"),
+    }
+
+
+print("cwd =", Path.cwd())
+print("env exists =", Path(".env").exists())
+
+env = _get_r2_env()
+print("R2_ENDPOINT =", env["R2_ENDPOINT"])
+print("R2_BUCKET =", env["R2_BUCKET"])
+print("AWS_ACCESS_KEY_ID exists =", bool(env["AWS_ACCESS_KEY_ID"]))
+print("AWS_SECRET_ACCESS_KEY exists =", bool(env["AWS_SECRET_ACCESS_KEY"]))
+
 # =========================
 # Config
 # =========================
@@ -30,10 +49,6 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 REWARDS_DIR = Path("./rewards")
 REWARDS_DIR.mkdir(parents=True, exist_ok=True)
 
-R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_BUCKET = os.getenv("R2_BUCKET")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 KEY_PARQUET = "data/test_hourly.parquet"
 KEY_MODEL_XGB = "model/xgb_demand_poisson.model"
@@ -56,12 +71,43 @@ PRED_COL = "pred_rides"
 MODEL_ENABLED = os.getenv("MODEL_ENABLED", "1").strip() not in ("0", "false", "False")
 
 # =========================
+# Hybrid dispatch config (ported from revised dispatch backend)
+# =========================
+W_DEMAND = 2.0
+W_PRIORITY = 0.9
+W_DISTANCE = 0.9
+W_ZONE_SUPPLY = 0.45
+W_LOCAL_SUPPLY = 0.20
+MIN_GAIN = 0.20
+
+LOCAL_RADIUS_KM = float(os.getenv("LOCAL_RADIUS_KM", "2.0"))
+MAX_CANDIDATE_RADIUS_KM = float(os.getenv("MAX_CANDIDATE_RADIUS_KM", "8.0"))
+MIN_NEAR = int(os.getenv("MIN_NEAR", "15"))
+K_NEAREST = int(os.getenv("K_NEAREST", "80"))
+TOP_K_RESULT = int(os.getenv("TOP_K_RESULT", "3"))
+
+SYNTH_IDLE_COUNT = int(os.getenv("SYNTH_IDLE_COUNT", "2000"))
+SYNTH_RANDOM_SEED = int(os.getenv("SYNTH_RANDOM_SEED", "20250801"))
+AIRPORT_BIAS = float(os.getenv("AIRPORT_BIAS", "1.8"))
+MIDTOWN_BIAS = float(os.getenv("MIDTOWN_BIAS", "1.5"))
+MANHATTAN_CORE_BIAS = float(os.getenv("MANHATTAN_CORE_BIAS", "1.25"))
+
+ACTIVE_ORDER_STATUSES = {
+    "assigned", "accepted", "en_route", "enroute", "picked_up", "in_progress", "on_trip", "ongoing"
+}
+MIDTOWN_KEYWORDS = [
+    "Midtown", "Times Sq", "Theatre District", "Penn Station", "Garment District",
+    "Union Sq", "Flatiron", "Murray Hill", "Kips Bay", "Chelsea"
+]
+AIRPORT_KEYWORDS = ["Airport", "JFK", "LaGuardia", "LGA"]
+
+# =========================
 # FastAPI app & State
 # =========================
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 正式上線再縮成前端網域
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,10 +120,12 @@ STATE: Dict[str, Any] = {
     "latest_hour": None,
     "pred_df": None,
     "pred_hour": None,
+    "pred_dispatch_df": None,
     "model_ready": False,
     "reward_df": None,
     "hotspots_df": None,
     "model_init_error": None,
+    "dispatch_zones_loaded_at": None,
 }
 
 # =========================
@@ -101,8 +149,11 @@ STORE: Dict[str, Any] = {
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+
 def _r2_config_ok() -> bool:
-    return all([R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY])
+    env = _get_r2_env()
+    return all(env.values())
 
 def save_store():
     for k, p in zip(
@@ -110,6 +161,7 @@ def save_store():
         [USERS_PATH, DRIVERS_PATH, ORDERS_PATH, META_PATH],
     ):
         p.write_text(json.dumps(STORE[k], ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def load_store():
     for k, p in zip(
@@ -119,31 +171,54 @@ def load_store():
         if p.exists():
             STORE[k] = json.loads(p.read_text(encoding="utf-8"))
 
+
 def _find_driver(driver_id: int):
     return next((d for d in STORE["drivers"] if int(d.get("id", 0)) == int(driver_id)), None)
+
 
 def _find_driver_by_name(name: str):
     name = (name or "").strip()
     return next((d for d in STORE["drivers"] if str(d.get("name", "")).strip() == name), None)
 
+
 def _find_user(username: str):
     username = (username or "").strip()
     return next((u for u in STORE["users"] if str(u.get("username", "")).strip() == username), None)
 
+
 def _find_order(order_id: int):
     return next((o for o in STORE["orders"] if int(o.get("id", 0)) == int(order_id)), None)
 
+
+def norm_status(status: str) -> str:
+    return str(status or "").strip().lower()
+
+
+def get_order_driver_id(order):
+    return order.get("driverId") or order.get("assignedDriverId") or order.get("driver_id")
+
+
+def is_driver_busy(driver_id: int) -> bool:
+    for o in STORE["orders"]:
+        if int(get_order_driver_id(o) or 0) != int(driver_id):
+            continue
+        if norm_status(o.get("status")) in ACTIVE_ORDER_STATUSES:
+            return True
+    return False
+
+
 def s3_client():
-    if not _r2_config_ok():
+    env = _get_r2_env()
+    if not all(env.values()):
         raise RuntimeError("Missing R2 environment variables")
 
     import boto3
 
     return boto3.client(
         "s3",
-        endpoint_url=R2_ENDPOINT,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        endpoint_url=env["R2_ENDPOINT"],
+        aws_access_key_id=env["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=env["AWS_SECRET_ACCESS_KEY"],
         region_name="auto",
     )
 
@@ -151,18 +226,23 @@ def upload_to_r2(local_path: Path, r2_key: str):
     if not local_path.exists():
         return
     try:
-        s3_client().upload_file(str(local_path), R2_BUCKET, r2_key)
+        env = _get_r2_env()
+        s3_client().upload_file(str(local_path), env["R2_BUCKET"], r2_key)
         print(f"⬆️ [Upload] {local_path.name} -> {r2_key} ✅")
     except Exception as e:
         print(f"❌ Upload error: {e}")
 
+
 def download_sync(key: str, dst: Path, label: str):
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
-        s3_client().download_file(R2_BUCKET, key, str(dst))
+        env = _get_r2_env()
+        print(f"DOWNLOAD TRY: label={label}, bucket={env['R2_BUCKET']}, key={key}, dst={dst}")
+        s3_client().download_file(env["R2_BUCKET"], key, str(dst))
         print(f"⬇️ [Download] {label} ✅")
     except Exception as e:
         print(f"⚠️ {label} 下載跳過: {e}")
+        raise
 
 def centroids_to_wgs84(df_cent):
     from pyproj import Transformer
@@ -175,6 +255,7 @@ def centroids_to_wgs84(df_cent):
     out = df_cent.copy()
     out["lon"], out["lat"] = lon_deg, lat_deg
     return out[["LocationID", "Borough", "Zone", "lat", "lon"]]
+
 
 def build_hotspots_df(pred_df, cent_df, reward_df):
     import pandas as pd
@@ -220,10 +301,229 @@ def build_hotspots_df(pred_df, cent_df, reward_df):
 
     return df
 
+
+def get_prediction_df_for_dispatch():
+    import pandas as pd
+
+    pred_csv_path = OUT_DIR / "pred_next_hour_advanced.csv"
+    if pred_csv_path.exists():
+        df = pd.read_csv(pred_csv_path)
+    elif STATE.get("pred_df") is not None:
+        df = STATE["pred_df"].copy()
+    else:
+        raise FileNotFoundError(f"Prediction file not found: {pred_csv_path}")
+
+    if PRED_COL not in df.columns:
+        for cand in ["pred_next_hour", "pred_next_hour_advanced", "yhat", "pred"]:
+            if cand in df.columns:
+                df = df.rename(columns={cand: PRED_COL})
+                break
+
+    required = {ZONE_COL, PRED_COL}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"pred csv missing columns: {sorted(missing)}")
+
+    return df.copy()
+
+
+def minmax01(series):
+    import pandas as pd
+
+    s = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+    mn = float(s.min()) if len(s) else 0.0
+    mx = float(s.max()) if len(s) else 0.0
+    if mx - mn < 1e-12:
+        return pd.Series([0.0] * len(s), index=s.index, dtype=float)
+    return (s - mn) / (mx - mn)
+
+
+def build_dispatch_zone_table():
+    import pandas as pd
+
+    if not CENT_PATH.exists():
+        raise FileNotFoundError(f"Centroid file not found: {CENT_PATH}")
+
+    df_pred = get_prediction_df_for_dispatch()
+    df_cent = pd.read_csv(CENT_PATH)
+    cent = centroids_to_wgs84(df_cent)
+    df = df_pred.merge(cent, left_on=ZONE_COL, right_on="LocationID", how="left")
+    df[PRED_COL] = pd.to_numeric(df[PRED_COL], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["lat", "lon"]).copy()
+
+    if "Borough" not in df.columns:
+        df["Borough"] = ""
+    if "Zone" not in df.columns:
+        df["Zone"] = df[ZONE_COL].astype(str)
+
+    df["priority"] = minmax01(df[PRED_COL])
+
+    def zone_bias(row) -> float:
+        zone = str(row.get("Zone", ""))
+        borough = str(row.get("Borough", ""))
+        bias = 1.0
+        if borough == "Manhattan":
+            bias *= MANHATTAN_CORE_BIAS
+        if any(k.lower() in zone.lower() for k in MIDTOWN_KEYWORDS):
+            bias *= MIDTOWN_BIAS
+        if any(k.lower() in zone.lower() for k in AIRPORT_KEYWORDS):
+            bias *= AIRPORT_BIAS
+        return bias
+
+    df["synthetic_bias"] = df.apply(zone_bias, axis=1)
+    df["demand_weight_for_supply"] = (df[PRED_COL].clip(lower=0.0) + 1e-9) * df["synthetic_bias"]
+    df["zone_id"] = df[ZONE_COL].astype(int)
+    df["lat_wgs"] = df["lat"].astype(float)
+    df["lon_wgs"] = df["lon"].astype(float)
+    return df.reset_index(drop=True)
+
+
+def refresh_dispatch_zones():
+    df = build_dispatch_zone_table()
+    STATE["pred_dispatch_df"] = df
+    STATE["dispatch_zones_loaded_at"] = _now_iso()
+    return df
+
+
+def get_dispatch_zones(force: bool = False):
+    if force or STATE.get("pred_dispatch_df") is None:
+        return refresh_dispatch_zones()
+    return STATE["pred_dispatch_df"]
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, sqrt, asin
+
+    r = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return 2 * r * asin(sqrt(a))
+
+
+def synthetic_idle_supply(df) -> Dict[int, int]:
+    rng = random.Random(SYNTH_RANDOM_SEED)
+    zone_ids = df["zone_id"].tolist()
+    weights = df["demand_weight_for_supply"].tolist()
+    picks = rng.choices(zone_ids, weights=weights, k=max(0, SYNTH_IDLE_COUNT))
+    supply = {int(z): 0 for z in zone_ids}
+    for z in picks:
+        supply[int(z)] += 1
+    return supply
+
+
+def nearest_zone_id(df, lat: float, lng: float) -> Optional[int]:
+    best_z, best_d = None, float("inf")
+    for _, r in df.iterrows():
+        d = haversine_km(lat, lng, float(r["lat_wgs"]), float(r["lon_wgs"]))
+        if d < best_d:
+            best_d = d
+            best_z = int(r["zone_id"])
+    return best_z
+
+
+def real_idle_supply(df) -> Dict[int, int]:
+    supply = {int(z): 0 for z in df["zone_id"].tolist()}
+    for d in STORE["drivers"]:
+        did = d.get("id")
+        lat = d.get("lat")
+        lng = d.get("lng")
+        if did is None or lat is None or lng is None:
+            continue
+        try:
+            did = int(did)
+            lat = float(lat)
+            lng = float(lng)
+        except Exception:
+            continue
+        if is_driver_busy(did):
+            continue
+        zid = nearest_zone_id(df, lat, lng)
+        if zid is not None:
+            supply[int(zid)] = supply.get(int(zid), 0) + 1
+    return supply
+
+
+def local_supply_for_zone(df, zone_supply_map: Dict[int, int], zone_id: int) -> int:
+    row = df.loc[df["zone_id"] == zone_id]
+    if row.empty:
+        return 0
+    src = row.iloc[0]
+    src_lat, src_lon = float(src["lat_wgs"]), float(src["lon_wgs"])
+    total = 0
+    for _, r in df.iterrows():
+        other_id = int(r["zone_id"])
+        if other_id == zone_id:
+            continue
+        d = haversine_km(src_lat, src_lon, float(r["lat_wgs"]), float(r["lon_wgs"]))
+        if d <= LOCAL_RADIUS_KM:
+            total += int(zone_supply_map.get(other_id, 0))
+    return total
+
+
+def build_supply_maps(df) -> Dict[str, Dict[int, int]]:
+    synth = synthetic_idle_supply(df)
+    real = real_idle_supply(df)
+    total = {int(z): int(synth.get(int(z), 0)) + int(real.get(int(z), 0)) for z in df["zone_id"].tolist()}
+    local = {int(z): local_supply_for_zone(df, total, int(z)) for z in df["zone_id"].tolist()}
+    return {"synthetic": synth, "real": real, "total": total, "local": local}
+
+
+def normalized_candidate_frame(df, driver_lat: float, driver_lng: float):
+    import pandas as pd
+
+    base = []
+    for _, r in df.iterrows():
+        dkm = haversine_km(driver_lat, driver_lng, float(r["lat_wgs"]), float(r["lon_wgs"]))
+        base.append({
+            "zone_id": int(r["zone_id"]),
+            "Zone": str(r.get("Zone", "")),
+            "Borough": str(r.get("Borough", "")),
+            "lat_wgs": float(r["lat_wgs"]),
+            "lon_wgs": float(r["lon_wgs"]),
+            PRED_COL: float(r[PRED_COL]),
+            "priority": float(r["priority"]),
+            "distance_km": float(dkm),
+        })
+
+    near = [x for x in base if x["distance_km"] <= MAX_CANDIDATE_RADIUS_KM]
+    if len(near) < MIN_NEAR:
+        near = sorted(base, key=lambda x: x["distance_km"])[:K_NEAREST]
+
+    cand = pd.DataFrame(near)
+    if cand.empty:
+        return cand
+
+    cand["DemandN"] = minmax01(cand[PRED_COL])
+    cand["PriorityN"] = minmax01(cand["priority"])
+    cand["DistanceN"] = minmax01(cand["distance_km"])
+    return cand
+
+
+def score_frame(cand, supply_maps: Dict[str, Dict[int, int]]):
+    if cand.empty:
+        return cand
+    cand = cand.copy()
+    cand["ZoneSupply"] = cand["zone_id"].map(lambda z: int(supply_maps["total"].get(int(z), 0)))
+    cand["LocalSupply"] = cand["zone_id"].map(lambda z: int(supply_maps["local"].get(int(z), 0)))
+    cand["ZoneSupplyN"] = minmax01(cand["ZoneSupply"])
+    cand["LocalSupplyN"] = minmax01(cand["LocalSupply"])
+    cand["Score"] = (
+        W_DEMAND * cand["DemandN"]
+        + W_PRIORITY * cand["PriorityN"]
+        - W_DISTANCE * cand["DistanceN"]
+        - W_ZONE_SUPPLY * cand["ZoneSupplyN"]
+        - W_LOCAL_SUPPLY * cand["LocalSupplyN"]
+    )
+    return cand
+
 # =========================
 # Lazy model init
 # =========================
 def init_model():
+    print("=== INIT_MODEL CALLED ===")
+    print("DEBUG _get_r2_env =", _get_r2_env())
+
     if STATE["model_ready"]:
         return
 
@@ -235,7 +535,6 @@ def init_model():
         STATE["model_init_error"] = "Missing R2 environment variables"
         raise RuntimeError(STATE["model_init_error"])
 
-    # 重套件與重邏輯全部延後到這裡
     import pandas as pd
     import xgboost as xgb
     from logic import run_prediction_task, generate_ranking_reports
@@ -247,12 +546,37 @@ def init_model():
         print("⚠️ build_zone_reward_from_311 匯入失敗，已跳過 311 分析功能")
 
     print("🔄 Initializing Models & Data...")
-    STATE["model_init_error"] = None
 
+    print("STEP 1: download XGB")
     download_sync(KEY_MODEL_XGB, MODEL_PATH_XGB, "XGB")
+
+    print("STEP 2: download Parquet")
     download_sync(KEY_PARQUET, PARQUET_PATH, "Parquet")
+
+    print("STEP 3: download Centroids")
     download_sync(KEY_CENT, CENT_PATH, "Centroids")
+
+    print("STEP 4: download 311 CSV")
     download_sync(KEY_311, PATH_311, "311_CSV")
+
+    if NET_PATH.exists():
+        print(f"NetXML exists, skip: {NET_PATH}")
+    else:
+        print("STEP 5: download NetXML")
+        download_sync(KEY_NET, NET_PATH, "NetXML")
+
+    print("STEP 6: load xgboost model")
+    booster = xgb.Booster()
+    booster.load_model(str(MODEL_PATH_XGB))
+
+    print("STEP 7: read centroids csv")
+    cent = pd.read_csv(CENT_PATH)
+
+    print("STEP 8: read parquet")
+    df = pd.read_parquet(PARQUET_PATH)
+
+    print("STEP 9: run prediction task")
+
 
     if NET_PATH.exists():
         print(f"NetXML exists, skip: {NET_PATH}")
@@ -319,6 +643,12 @@ def init_model():
                 print(f"⚠️ build_hotspots_df failed: {e}")
                 STATE["hotspots_df"] = None
 
+            try:
+                refresh_dispatch_zones()
+            except Exception as e:
+                print(f"⚠️ dispatch zone refresh failed during init: {e}")
+                STATE["pred_dispatch_df"] = None
+
         STATE["model_ready"] = True
         print("✅ Model init complete.")
     except Exception as e:
@@ -336,21 +666,26 @@ class RegisterBody(BaseModel):
     role: str = "passenger"
     carType: Optional[str] = None
 
+
 class LoginBody(BaseModel):
     username: str
     password: str
+
 
 class DriverLoginBody(BaseModel):
     name: str
     carType: Optional[str] = None
 
+
 class DriverLocationBody(BaseModel):
     lat: float
     lng: float
 
+
 class LatLng(BaseModel):
     lat: float
     lng: float
+
 
 class CreateOrderBody(BaseModel):
     customer: Optional[str] = None
@@ -362,6 +697,7 @@ class CreateOrderBody(BaseModel):
     vehicleType: Optional[str] = None
     estimatedPrice: Optional[float] = None
     distanceKm: Optional[float] = None
+
 
 class AcceptOrderBody(BaseModel):
     driverId: int
@@ -377,6 +713,12 @@ def startup_all():
     except Exception as e:
         print(f"⚠️ load_store failed: {e}")
 
+    try:
+        init_model()
+        print("✅ Model initialized at startup.")
+    except Exception as e:
+        print(f"⚠️ init_model failed at startup: {e}")
+
 # =========================
 # Health
 # =========================
@@ -388,6 +730,9 @@ def api_health():
         "model_init_error": STATE["model_init_error"],
         "drivers": len(STORE["drivers"]),
         "orders": len(STORE["orders"]),
+        "dispatch_formula": "Score = 2.0*Demand + 0.9*Priority - 0.9*Distance - 0.45*ZoneSupply - 0.20*LocalSupply",
+        "min_gain": MIN_GAIN,
+        "dispatch_zones_loaded_at": STATE.get("dispatch_zones_loaded_at"),
     }
 
 # =========================
@@ -425,6 +770,124 @@ def hotspots(n: int = 20, sort_by: str = "final_score"):
         "predict_hour": str(STATE["pred_hour"]),
         "rows": df_out.to_dict(orient="records"),
     }
+
+
+@app.get("/api/zone-hotspots")
+def api_zone_hotspots():
+    if not STATE["model_ready"]:
+        try:
+            init_model()
+        except Exception as e:
+            raise HTTPException(503, f"Model init failed: {e}")
+
+    try:
+        df = get_dispatch_zones(force=False).copy()
+    except Exception as e:
+        raise HTTPException(503, f"Dispatch hotspots not ready: {e}")
+
+    out = df[["zone_id", ZONE_COL, "Borough", "Zone", "lat_wgs", "lon_wgs", PRED_COL, "priority"]].copy()
+    return {
+        "rows": out.to_dict(orient="records"),
+        "prediction_mode": "model_pipeline",
+        "predict_hour": str(STATE.get("pred_hour")),
+    }
+
+
+@app.get("/api/dispatch-recommendations")
+def api_dispatch_recommendations(driver_id: Optional[int] = None, lat: Optional[float] = None, lng: Optional[float] = None, top_k: int = TOP_K_RESULT):
+    if not STATE["model_ready"]:
+        try:
+            init_model()
+        except Exception as e:
+            raise HTTPException(503, f"Model init failed: {e}")
+
+    try:
+        df = get_dispatch_zones(force=False)
+    except Exception as e:
+        raise HTTPException(503, f"Dispatch zones not ready: {e}")
+
+    driver_name = None
+
+    if driver_id is not None:
+        d = _find_driver(driver_id)
+        if d is None:
+            raise HTTPException(404, f"Driver {driver_id} not found")
+        driver_name = d.get("name")
+        if lat is None:
+            lat = d.get("lat")
+        if lng is None:
+            lng = d.get("lng")
+
+    if lat is None or lng is None:
+        raise HTTPException(400, "Missing driver lat/lng")
+
+    driver_lat = float(lat)
+    driver_lng = float(lng)
+    current_zone_id = nearest_zone_id(df, driver_lat, driver_lng)
+    if current_zone_id is None:
+        raise HTTPException(503, "Unable to infer current zone")
+
+    cand = normalized_candidate_frame(df, driver_lat, driver_lng)
+    if cand.empty:
+        return {"rows": [], "current_zone_id": current_zone_id}
+
+    supply_maps = build_supply_maps(df)
+    cand = score_frame(cand, supply_maps)
+
+    current_row = cand[cand["zone_id"] == current_zone_id]
+    current_score = float(current_row["Score"].iloc[0]) if not current_row.empty else None
+    cand["Gain"] = cand["Score"] - (current_score if current_score is not None else 0.0)
+    cand["move_recommended"] = cand["Gain"] > MIN_GAIN
+    cand = cand[cand["zone_id"] != current_zone_id].copy()
+    cand.sort_values("Score", ascending=False, inplace=True)
+    cand["road_km"] = cand["distance_km"]
+
+    out = cand.head(max(1, int(top_k))).copy()
+    rows = []
+    for _, r in out.iterrows():
+        rows.append({
+            "zone_id": int(r["zone_id"]),
+            "PULocationID": int(r["zone_id"]),
+            "Borough": str(r["Borough"]),
+            "Zone": str(r["Zone"]),
+            "lat_wgs": float(r["lat_wgs"]),
+            "lon_wgs": float(r["lon_wgs"]),
+            "pred_rides": float(r[PRED_COL]),
+            "priority": float(r["priority"]),
+            "distance_km": float(r["distance_km"]),
+            "road_km": float(r["road_km"]),
+            "zone_supply": int(r["ZoneSupply"]),
+            "local_supply": int(r["LocalSupply"]),
+            "DemandN": float(r["DemandN"]),
+            "PriorityN": float(r["PriorityN"]),
+            "DistanceN": float(r["DistanceN"]),
+            "ZoneSupplyN": float(r["ZoneSupplyN"]),
+            "LocalSupplyN": float(r["LocalSupplyN"]),
+            "score": float(r["Score"]),
+            "gain": float(r["Gain"]),
+            "move_recommended": bool(r["move_recommended"]),
+        })
+
+    current_zone = df.loc[df["zone_id"] == current_zone_id].iloc[0]
+    return {
+        "driver_id": driver_id,
+        "driver_name": driver_name,
+        "driver_lat": driver_lat,
+        "driver_lng": driver_lng,
+        "current_zone_id": int(current_zone_id),
+        "current_zone": str(current_zone["Zone"]),
+        "current_score": current_score,
+        "min_gain": MIN_GAIN,
+        "formula": {
+            "W_DEMAND": W_DEMAND,
+            "W_PRIORITY": W_PRIORITY,
+            "W_DISTANCE": W_DISTANCE,
+            "W_ZONE_SUPPLY": W_ZONE_SUPPLY,
+            "W_LOCAL_SUPPLY": W_LOCAL_SUPPLY,
+        },
+        "rows": rows,
+    }
+
 
 @app.get("/api/driver-bias/{driver_id}")
 def get_driver_reward_bias(driver_id: int):
@@ -478,6 +941,7 @@ def api_register(body: RegisterBody):
     save_store()
     return {"ok": True, "user": user}
 
+
 @app.post("/api/login")
 def api_login(body: LoginBody):
     u = _find_user(body.username)
@@ -488,6 +952,7 @@ def api_login(body: LoginBody):
         raise HTTPException(401, detail={"errorCode": "BAD_PASSWORD", "error": "Wrong password"})
 
     return {"ok": True, "user": u}
+
 
 @app.post("/api/driver-login")
 def api_driver_login(body: DriverLoginBody):
@@ -543,6 +1008,7 @@ def api_create_order(body: CreateOrderBody):
     save_store()
     return {"ok": True, "order": order}
 
+
 @app.post("/api/orders/{order_id}/accept")
 def api_accept_order(order_id: int, body: AcceptOrderBody):
     o = _find_order(order_id)
@@ -553,6 +1019,7 @@ def api_accept_order(order_id: int, body: AcceptOrderBody):
     o.update({"status": "assigned", "driverId": body.driverId, "updatedAt": _now_iso()})
     save_store()
     return {"ok": True, "order": o}
+
 
 @app.post("/api/orders/{order_id}/complete")
 def api_complete_order(order_id: int):
@@ -568,6 +1035,7 @@ def api_complete_order(order_id: int):
     save_store()
     return {"ok": True, "order": o}
 
+
 @app.patch("/api/drivers/{driver_id}/location")
 def api_driver_location(driver_id: int, body: DriverLocationBody):
     d = _find_driver(driver_id)
@@ -581,9 +1049,11 @@ def api_driver_location(driver_id: int, body: DriverLocationBody):
 
     return {"ok": True, "updated_driver": d["id"], "name": d["name"]}
 
+
 @app.get("/api/orders")
 def api_get_orders():
     return {"rows": STORE["orders"]}
+
 
 @app.get("/api/drivers")
 def api_get_drivers():
@@ -653,12 +1123,82 @@ def api_run_pipeline(background_tasks: BackgroundTasks):
                 print(f"⚠️ build_hotspots_df failed: {e}")
                 STATE["hotspots_df"] = None
 
+            try:
+                refresh_dispatch_zones()
+            except Exception as e:
+                print(f"⚠️ dispatch zone refresh failed after pipeline: {e}")
+                STATE["pred_dispatch_df"] = None
+
         except Exception as e:
             print(f"❌ Pipeline task failed: {e}")
 
     background_tasks.add_task(task)
     return {"ok": True, "message": "Pipeline started"}
 
+
+@app.post("/api/admin/reload-dispatch-zones")
+def api_reload_dispatch_zones():
+    if not STATE["model_ready"]:
+        try:
+            init_model()
+        except Exception as e:
+            raise HTTPException(503, f"Model init failed: {e}")
+
+    try:
+        df = get_dispatch_zones(force=True)
+    except Exception as e:
+        raise HTTPException(503, f"Reload dispatch zones failed: {e}")
+
+    return {
+        "ok": True,
+        "zones_loaded_at": STATE.get("dispatch_zones_loaded_at"),
+        "rows": len(df),
+    }
+
+# =========================
+# Route
+# =========================
+@app.get("/api/route")
+async def api_route(fromLat: float, fromLng: float, toLat: float, toLng: float):
+    try:
+        url = (
+            "https://router.project-osrm.org/route/v1/driving/"
+            f"{fromLng},{fromLat};{toLng},{toLat}"
+            "?overview=full&geometries=geojson"
+        )
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers={"User-Agent": "taxi-app"})
+            r.raise_for_status()
+            data = r.json()
+
+        routes = data.get("routes") or []
+        if not routes:
+            return {"coords": [], "dist": None}
+
+        route = routes[0]
+        geometry = route.get("geometry", {})
+        raw_coords = geometry.get("coordinates") or []
+
+        coords = []
+        for item in raw_coords:
+            try:
+                lng, lat = item
+                coords.append([float(lat), float(lng)])
+            except Exception:
+                continue
+
+        dist = route.get("distance")
+        dist_km = float(dist) / 1000.0 if dist is not None else None
+
+        return {
+            "coords": coords,
+            "dist": dist_km,
+        }
+    except Exception as e:
+        print(f"⚠️ route api failed: {e}")
+        return {"coords": [], "dist": None}
+    
 # =========================
 # Geocode
 # =========================
